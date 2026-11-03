@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Антирадар">
+<meta name="theme-color" content="#000000">
+<title>Антирадар</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #000; color: #fff;
+    font-family: -apple-system, system-ui, sans-serif;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+    padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+    transition: background .3s;
+  }
+  body.alert { background: #b00020; }
+  #speed { font-size: 120px; font-weight: 800; line-height: 1; }
+  #unit { opacity: .6; margin-top: -10px; }
+  #cam { font-size: 26px; font-weight: 700; text-align: center; min-height: 36px; }
+  #status { font-size: 13px; opacity: .6; text-align: center; }
+  button {
+    font-size: 20px; font-weight: 700; padding: 16px 40px;
+    border: 0; border-radius: 16px; background: #1e88e5; color: #fff;
+  }
+  button.stop { background: #333; }
+</style>
+</head>
+<body>
+  <div id="speed">0</div>
+  <div id="unit">км/ч</div>
+  <div id="cam">Камер впереди нет</div>
+  <button id="btn">Старт</button>
+  <div id="status">Нажмите «Старт»</div>
+
+<script>
+const ALERT_DIST = 600;   // метров до камеры
+const RESET_DIST = 1000;  // после этого камера может сработать снова
+const MAX_ANGLE  = 45;    // камера должна быть впереди по ходу (±градусов)
+
+let cameras = [];
+let alerted = new Set();
+let watchId = null;
+let wakeLock = null;
+
+const $ = id => document.getElementById(id);
+
+// ---------- расстояние и направление ----------
+function dist(lat1, lon1, lat2, lon2) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+function bearing(lat1, lon1, lat2, lon2) {
+  const r = Math.PI / 180;
+  const y = Math.sin((lon2 - lon1) * r) * Math.cos(lat2 * r);
+  const x = Math.cos(lat1 * r) * Math.sin(lat2 * r) -
+            Math.sin(lat1 * r) * Math.cos(lat2 * r) * Math.cos((lon2 - lon1) * r);
+  return (Math.atan2(y, x) / r + 360) % 360;
+}
+
+// ---------- голос и звук ----------
+function say(text) {
+  try {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ru-RU';
+    speechSynthesis.speak(u);
+  } catch (e) {}
+  if (navigator.vibrate) navigator.vibrate([300, 100, 300]);
+}
+
+// ---------- загрузка камер ----------
+async function loadCameras() {
+  try {
+    const cached = JSON.parse(localStorage.getItem('cams') || 'null');
+    if (cached && Date.now() - cached.t < 7 * 864e5) {
+      cameras = cached.list;
+      $('status').textContent = 'Камер в базе: ' + cameras.length + ' (из кэша)';
+      return;
+    }
+  } catch (e) {}
+
+  $('status').textContent = 'Загружаю камеры Москвы…';
+  const q = '[out:json][timeout:60];node["highway"="speed_camera"](55.48,37.30,56.00,37.95);out;';
+  try {
+    const r = await fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(q));
+    const j = await r.json();
+    cameras = j.elements.map(e => ({
+      id: e.id, lat: e.lat, lon: e.lon,
+      max: e.tags && parseInt(e.tags.maxspeed) || null
+    }));
+    localStorage.setItem('cams', JSON.stringify({ t: Date.now(), list: cameras }));
+    $('status').textContent = 'Камер в базе: ' + cameras.length;
+  } catch (e) {
+    $('status').textContent = 'Не удалось загрузить камеры. Проверьте интернет.';
+  }
+}
+
+// ---------- обработка позиции ----------
+function onPos(pos) {
+  const { latitude: lat, longitude: lon, speed, heading } = pos.coords;
+  const kmh = speed != null ? Math.max(0, speed * 3.6) : 0;
+  $('speed').textContent = Math.round(kmh);
+
+  let nearest = null, nearestCam = null;
+
+  for (const c of cameras) {
+    // быстрый отсев по координатам (~1.5 км)
+    if (Math.abs(c.lat - lat) > 0.015 || Math.abs(c.lon - lon) > 0.03) {
+      alerted.delete(c.id); continue;
+    }
+    const d = dist(lat, lon, c.lat, c.lon);
+    if (d > RESET_DIST) { alerted.delete(c.id); continue; }
+    if (d > ALERT_DIST) continue;
+
+    if (heading != null && !isNaN(heading) && kmh > 5) {
+      let diff = Math.abs(bearing(lat, lon, c.lat, c.lon) - heading);
+      if (diff > 180) diff = 360 - diff;
+      if (diff > MAX_ANGLE) continue;
+    }
+
+    if (nearest == null || d < nearest) { nearest = d; nearestCam = c; }
+  }
+
+  if (nearestCam) {
+    document.body.classList.add('alert');
+    $('cam').textContent = '📸 Камера через ' + Math.round(nearest) + ' м' +
+      (nearestCam.max ? ' · лимит ' + nearestCam.max : '');
+    if (!alerted.has(nearestCam.id)) {
+      alerted.add(nearestCam.id);
+      const m = Math.round(nearest / 50) * 50;
+      say('Камера через ' + m + ' метров' +
+          (nearestCam.max ? ', ограничение ' + nearestCam.max : ''));
+    }
+  } else {
+    document.body.classList.remove('alert');
+    $('cam').textContent = 'Камер впереди нет';
+  }
+}
+
+function onErr(e) {
+  $('status').textContent = 'Геолокация: ' + e.message +
+    ' (разрешите доступ в Настройки → Safari → Геопозиция)';
+}
+
+// ---------- старт / стоп ----------
+async function start() {
+  // «разблокировать» голос жестом пользователя
+  try { speechSynthesis.speak(new SpeechSynthesisUtterance('')); } catch (e) {}
+  await loadCameras();
+  watchId = navigator.geolocation.watchPosition(onPos, onErr,
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  $('btn').textContent = 'Стоп';
+  $('btn').classList.add('stop');
+  if (cameras.length) $('status').textContent = 'Работает. Камер: ' + cameras.length + '. Экран держите включённым.';
+}
+function stop() {
+  if (watchId != null) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  $('btn').textContent = 'Старт';
+  $('btn').classList.remove('stop');
+  document.body.classList.remove('alert');
+  $('status').textContent = 'Остановлено';
+}
+$('btn').onclick = () => watchId == null ? start() : stop();
+
+// вернуть блокировку экрана при возврате в приложение
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && watchId != null) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+});
+</script>
+</body>
+</html>
