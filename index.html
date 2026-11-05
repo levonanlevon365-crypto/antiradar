@@ -77,48 +77,67 @@ function say(text) {
 }
 
 // ---------- загрузка камер ----------
+function getPos() {
+  return new Promise((res, rej) =>
+    navigator.geolocation.getCurrentPosition(res, rej,
+      { enableHighAccuracy: false, maximumAge: 600000, timeout: 20000 }));
+}
+
 async function loadCameras() {
+  // кэш на 7 дней, если вы всё ещё рядом с местом загрузки
+  let pos = null;
+  try { pos = await getPos(); } catch (e) {}
   try {
-    const cached = JSON.parse(localStorage.getItem('cams') || 'null');
-    if (cached && Date.now() - cached.t < 7 * 864e5) {
-      cameras = cached.list;
+    const c = JSON.parse(localStorage.getItem('cams2') || 'null');
+    if (c && Date.now() - c.t < 7 * 864e5 &&
+        (!pos || dist(pos.coords.latitude, pos.coords.longitude, c.lat, c.lon) < 6000)) {
+      cameras = c.list;
       $('status').textContent = 'Камер в базе: ' + cameras.length + ' (из кэша)';
       return;
     }
   } catch (e) {}
 
-  $('status').textContent = 'Загружаю камеры Москвы…';
-  const q = '[out:json][timeout:60];node["highway"="speed_camera"](55.48,37.30,56.00,37.95);out;';
+  const lat = pos ? pos.coords.latitude : 55.75;
+  const lon = pos ? pos.coords.longitude : 37.62;
+  const q = '[out:json][timeout:25];node["highway"="speed_camera"](around:12000,' +
+            lat.toFixed(4) + ',' + lon.toFixed(4) + ');out;';
   const mirrors = [
-    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+    'https://overpass-api.de/api/interpreter',
+    'https://z.overpass-api.de/api/interpreter',
+    'https://lz4.overpass-api.de/api/interpreter',
     'https://overpass.private.coffee/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
-    'https://overpass-api.de/api/interpreter'
+    'https://overpass.openstreetmap.fr/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter'
   ];
-  let lastErr = '';
-  for (const url of mirrors) {
+  $('status').textContent = 'Загружаю камеры рядом с вами…';
+
+  const tries = mirrors.map(async url => {
     const host = url.split('/')[2];
-    $('status').textContent = 'Загружаю камеры… (' + host + ')';
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 30000);
+    const timer = setTimeout(() => ctrl.abort(), 60000);
     try {
       const r = await fetch(url + '?data=' + encodeURIComponent(q), { signal: ctrl.signal });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.ok) throw new Error(host + ' HTTP ' + r.status);
       const j = await r.json();
-      clearTimeout(timer);
-      cameras = j.elements.map(e => ({
-        id: e.id, lat: e.lat, lon: e.lon,
-        max: e.tags && parseInt(e.tags.maxspeed) || null
-      }));
-      localStorage.setItem('cams', JSON.stringify({ t: Date.now(), list: cameras }));
-      $('status').textContent = 'Камер в базе: ' + cameras.length;
-      return;
+      return j.elements;
     } catch (e) {
-      clearTimeout(timer);
-      lastErr = host + ': ' + (e.name === 'AbortError' ? 'таймаут' : e.message);
-    }
+      throw new Error(host + ': ' + (e.name === 'AbortError' ? 'таймаут' : e.message));
+    } finally { clearTimeout(timer); }
+  });
+
+  try {
+    const els = await Promise.any(tries);
+    cameras = els.map(e => ({
+      id: e.id, lat: e.lat, lon: e.lon,
+      max: e.tags && parseInt(e.tags.maxspeed) || null
+    }));
+    localStorage.setItem('cams2', JSON.stringify({ t: Date.now(), lat, lon, list: cameras }));
+    $('status').textContent = 'Камер в радиусе 12 км: ' + cameras.length;
+  } catch (agg) {
+    const errs = (agg.errors || []).map(e => e.message).join('; ');
+    $('status').textContent = 'Не удалось загрузить камеры (' + errs + '). Попробуйте мобильный интернет вместо Wi-Fi.';
   }
-  $('status').textContent = 'Не удалось загрузить камеры (' + lastErr + ')';
 }
 
 // ---------- обработка позиции ----------
@@ -200,3 +219,4 @@ document.addEventListener('visibilitychange', async () => {
 </script>
 </body>
 </html>
+
